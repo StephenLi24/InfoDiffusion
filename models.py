@@ -466,7 +466,6 @@ class Encoder(nn.Module):
             nn.SiLU(),
             nn.Conv2d(now_ch, 1, 3, stride=1, padding=1)
         )
-
         self.fc_a = nn.Linear(self.shape[1]*self.shape[2], self.a_dim)
         self.fc_mu = nn.Linear(self.a_dim, self.a_dim)
         self.fc_var = nn.Linear(self.a_dim, self.a_dim)
@@ -722,7 +721,337 @@ class InfoDiff(nn.Module):
 
         return (output, epsilon, a, mu, log_var) if get_target else output
 
+class OptDiff(nn.Module):
+    def __init__(self, args, device, shape):
+        '''
+        beta_1    : beta_1 of diffusion process
+        beta_T    : beta_T of diffusion process
+        T         : Diffusion Steps
+        '''
 
+        super().__init__()
+        self.device = device
+        self.alpha_bars = torch.cumprod(1 - torch.linspace(start=args.beta1, end=args.betaT, steps=args.diffusion_steps), dim=0).to(device=device)
+        self.betas = torch.linspace(start=args.beta1, end=args.betaT, steps=args.diffusion_steps).to(device = device)
+        self.alphas = 1 - self.betas
+        self.alpha_prev_bars = torch.cat([torch.Tensor([1]).to(device=device), self.alpha_bars[:-1]])
+        if args.input_size == 28:
+            ch_mult = [1,2,4,]
+        else:
+            ch_mult = [1,2,2,2]
+        if args.is_bottleneck:
+            self.backbone = BottleneckAuxUNet(ch_mult=ch_mult, T=args.diffusion_steps, ch=args.unets_channels, a_dim=args.a_dim, shape=shape)
+        else:
+            self.backbone = AuxiliaryUNet(ch_mult=ch_mult, T=args.diffusion_steps, ch=args.unets_channels, a_dim=args.a_dim, shape=shape)
+        self.encoder = Encoder(ch_mult=ch_mult, ch=args.encoder_channels, a_dim=args.a_dim, shape=shape)
+        self.mmd_weight : float = args.mmd_weight
+        self.kld_weight : float = args.kld_weight
+        self.to(device)
+
+    def loss_fn(self, args, x, idx=None, curr_epoch=0):
+        '''
+        x          : real data if idx==None else perturbation data
+        idx        : if None (training phase), we perturbed random index.
+        '''
+        output, epsilon, a, mu, log_var = self.forward(x, idx=idx, get_target=True)
+
+        # denoising matching term
+        loss = (output - epsilon).square().mean()
+        print('denoising loss:', loss)
+
+        # reconstruction term
+        x_0 = torch.sqrt(1 / self.alphas[0]) * (x - self.betas[0] / torch.sqrt(1 - self.alpha_bars[0]) * output)
+        loss_rec = (x_0 - x).square().mean()
+        loss += loss_rec / args.diffusion_steps
+        print('recon loss:', loss_rec / args.diffusion_steps)
+
+        if self.mmd_weight != 0 and self.kld_weight != 0:
+            # MMD term
+            if args.prior == 'regular':
+                true_samples = torch.randn_like(a, device=self.device)
+            elif args.prior == '10mix':
+                prior = gaussian_mixture(args.batch_size, args.a_dim)
+                true_samples = torch.FloatTensor(prior).to(device=self.device)
+            elif args.prior == 'roll':
+                prior = swiss_roll(args.batch_size)
+                true_samples = torch.FloatTensor(prior).to(device=self.device)
+            loss_mmd = compute_mmd(true_samples, mu)
+            print('mmd loss:', args.mmd_weight * loss_mmd)
+            loss += args.mmd_weight * loss_mmd
+            # KLD term
+            kld_loss = torch.sum(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim=1), dim=0)
+            if args.use_C:
+                # KLD term w/ control constant
+                self.C_max = torch.FloatTensor([args.C_max]).to(device=self.device)
+                C = torch.clamp(self.C_max/args.epochs*curr_epoch, torch.FloatTensor([0]).to(device=self.device), self.C_max)
+                loss += args.kld_weight * (kld_loss - C.squeeze(dim=0)).abs()
+            else:
+                print('kld loss:', args.kld_weight * kld_loss)
+                loss += args.kld_weight * kld_loss
+        elif args.mmd_weight != 0:
+            # MMD term
+            if args.prior == 'regular':
+                true_samples = torch.randn_like(a, device=self.device)
+            elif args.prior == '10mix':
+                prior = gaussian_mixture(args.batch_size, args.a_dim)
+                true_samples = torch.FloatTensor(prior).to(device=self.device)
+            elif args.prior == 'roll':
+                prior = swiss_roll(args.batch_size)
+                true_samples = torch.FloatTensor(prior).to(device=self.device)
+            loss_mmd = compute_mmd(true_samples, a)
+            print('mmd loss:', args.mmd_weight * loss_mmd)
+            loss += args.mmd_weight * loss_mmd
+        elif args.kld_weight != 0:
+            # KLD term
+            kld_loss = torch.sum(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim=1), dim=0)
+            if args.use_C:
+                # KLD term w/ control constant
+                self.C_max = torch.FloatTensor([args.C_max]).to(device=self.device)
+                C = torch.clamp(self.C_max/args.epochs*curr_epoch, torch.FloatTensor([0]).to(device=self.device), self.C_max)
+                loss += args.kld_weight * (kld_loss - C.squeeze(dim=0)).abs()
+            else:
+                print('kld loss:', args.kld_weight * kld_loss)
+                loss += args.kld_weight * kld_loss
+        return loss
+
+    def forward(self, x, idx=None, a=None, get_target=False):
+
+        if idx is None:
+            idx = torch.randint(0, len(self.alpha_bars), (x.size(0), )).to(device = self.device)
+            used_alpha_bars = self.alpha_bars[idx][:, None, None, None]
+            epsilon = torch.randn_like(x)
+            x_tilde = torch.sqrt(used_alpha_bars) * x + torch.sqrt(1 - used_alpha_bars) * epsilon
+            # 计算解耦偏移量，beta_step 可以根据需要调整
+            offset = self.disentangle_offset(x_tilde, 1)
+            x_tilde = x_tilde + offset
+        else:
+            idx = torch.Tensor([idx for _ in range(x.size(0))]).to(device = self.device).long()
+            x_tilde = x
+            # 计算解耦偏移量，beta_step 可以根据需要调整
+            offset = self.disentangle_offset(x_tilde, 0.7)
+            x_tilde = x_tilde + offset
+
+        if a is None:
+            a, a_q, mu, log_var = self.encoder(x)
+        else:
+            a_q = a
+
+        if self.mmd_weight != 0 and self.kld_weight != 0:
+            output = self.backbone(x_tilde, idx, a_q)
+        elif self.mmd_weight == 0 and self.kld_weight == 0:
+            output = self.backbone(x_tilde, idx, a)
+        elif self.mmd_weight != 0:
+            output = self.backbone(x_tilde, idx, a)
+        elif self.kld_weight != 0:
+            output = self.backbone(x_tilde, idx, a_q)
+
+        return (output, epsilon, a, mu, log_var) if get_target else output
+    
+    def disentangle_offset(self, previous_noise, beta_step=1):
+        """
+            Introduce a disentanglement offset during the forward process in diffusion.
+
+            Args:
+                previous_noise (torch.Tensor): The input noise tensor of shape (batch_size, channel, img_height, img_width).
+                beta_step (float): Scaling factor for the offset.
+
+            Returns:
+                torch.Tensor: The adjusted noise tensor with the disentanglement offset applied.
+        """
+        # Get the batch size, channels, height, and width
+        batch_size, channels, height, width = previous_noise.shape
+
+        # Flatten the spatial dimensions (height, width) to create features
+        flattened_noise = previous_noise.view(batch_size, channels, -1)  # Shape: (batch_size, channels, num_pixels)
+
+        # Normalize each vector in the batch to have unit norm
+        flattened_noise = flattened_noise.view(batch_size, -1)  # Flatten to (batch_size, channels * num_pixels)
+        normalized_noise = torch.nn.functional.normalize(flattened_noise, p=2, dim=1)  # Shape: (batch_size, channels * num_pixels)
+
+        # Compute pairwise cosine similarities
+        cosine_similarities = torch.mm(normalized_noise, normalized_noise.T)  # Shape: (batch_size, batch_size)
+
+        # Remove diagonal elements (self-similarities) to compute D
+        mask = torch.eye(cosine_similarities.size(0), device=cosine_similarities.device).bool()
+        cosine_similarities = cosine_similarities.masked_fill(mask, 0)
+
+        # Compute the sum of off-diagonal elements (D) 
+        disentanglement_offset = torch.sum(cosine_similarities, dim=1, keepdim=True)  # Shape: (batch_size, 1)
+
+        # Scale the disentanglement offset with beta_step
+        disentanglement_offset *= beta_step
+
+        # Reshape the disentanglement offset to match the spatial dimensions
+        disentanglement_offset = disentanglement_offset.view(batch_size, 1, 1, 1)  # Shape: (batch_size, 1, 1, 1)
+        disentanglement_offset = disentanglement_offset.expand(-1, channels, height, width)  # Shape: (batch_size, channels, height, width)
+        # print('disentanglement_offset.shape', disentanglement_offset.shape)
+
+        return disentanglement_offset
+
+class ShiftDiff(nn.Module):
+    def __init__(self, args, device, shape):
+        '''
+        beta_1    : beta_1 of diffusion process
+        beta_T    : beta_T of diffusion process
+        T         : Diffusion Steps
+        '''
+
+        super().__init__()
+        self.device = device
+        self.alpha_bars = torch.cumprod(1 - torch.linspace(start=args.beta1, end=args.betaT, steps=args.diffusion_steps), dim=0).to(device=device)
+        self.betas = torch.linspace(start=args.beta1, end=args.betaT, steps=args.diffusion_steps).to(device = device)
+        self.alphas = 1 - self.betas
+        self.alpha_prev_bars = torch.cat([torch.Tensor([1]).to(device=device), self.alpha_bars[:-1]])
+        if args.input_size == 28:
+            ch_mult = [1,2,4,]
+        else:
+            ch_mult = [1,2,2,2]
+        if args.is_bottleneck:
+            self.backbone = BottleneckAuxUNet(ch_mult=ch_mult, T=args.diffusion_steps, ch=args.unets_channels, a_dim=args.a_dim, shape=shape)
+        else:
+            self.backbone = AuxiliaryUNet(ch_mult=ch_mult, T=args.diffusion_steps, ch=args.unets_channels, a_dim=args.a_dim, shape=shape)
+        self.encoder = Encoder(ch_mult=ch_mult, ch=args.encoder_channels, a_dim=args.a_dim, shape=shape)
+        self.mmd_weight : float = args.mmd_weight
+        self.kld_weight : float = args.kld_weight
+        self.to(device)
+
+    def loss_fn(self, args, x, idx=None, curr_epoch=0):
+        '''
+        x          : real data if idx==None else perturbation data
+        idx        : if None (training phase), we perturbed random index.
+        '''
+        output, epsilon, a, mu, log_var = self.forward(x, idx=idx, get_target=True)
+
+        # denoising matching term
+        loss = (output - epsilon).square().mean()
+        print('denoising loss:', loss)
+
+        # reconstruction term
+        x_0 = torch.sqrt(1 / self.alphas[0]) * (x - self.betas[0] / torch.sqrt(1 - self.alpha_bars[0]) * output)
+        loss_rec = (x_0 - x).square().mean()
+        loss += loss_rec / args.diffusion_steps
+        print('recon loss:', loss_rec / args.diffusion_steps)
+
+        if self.mmd_weight != 0 and self.kld_weight != 0:
+            # MMD term
+            if args.prior == 'regular':
+                true_samples = torch.randn_like(a, device=self.device)
+            elif args.prior == '10mix':
+                prior = gaussian_mixture(args.batch_size, args.a_dim)
+                true_samples = torch.FloatTensor(prior).to(device=self.device)
+            elif args.prior == 'roll':
+                prior = swiss_roll(args.batch_size)
+                true_samples = torch.FloatTensor(prior).to(device=self.device)
+            loss_mmd = compute_mmd(true_samples, mu)
+            print('mmd loss:', args.mmd_weight * loss_mmd)
+            loss += args.mmd_weight * loss_mmd
+            # KLD term
+            kld_loss = torch.sum(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim=1), dim=0)
+            if args.use_C:
+                # KLD term w/ control constant
+                self.C_max = torch.FloatTensor([args.C_max]).to(device=self.device)
+                C = torch.clamp(self.C_max/args.epochs*curr_epoch, torch.FloatTensor([0]).to(device=self.device), self.C_max)
+                loss += args.kld_weight * (kld_loss - C.squeeze(dim=0)).abs()
+            else:
+                print('kld loss:', args.kld_weight * kld_loss)
+                loss += args.kld_weight * kld_loss
+        elif args.mmd_weight != 0:
+            # MMD term
+            if args.prior == 'regular':
+                true_samples = torch.randn_like(a, device=self.device)
+            elif args.prior == '10mix':
+                prior = gaussian_mixture(args.batch_size, args.a_dim)
+                true_samples = torch.FloatTensor(prior).to(device=self.device)
+            elif args.prior == 'roll':
+                prior = swiss_roll(args.batch_size)
+                true_samples = torch.FloatTensor(prior).to(device=self.device)
+            loss_mmd = compute_mmd(true_samples, a)
+            print('mmd loss:', args.mmd_weight * loss_mmd)
+            loss += args.mmd_weight * loss_mmd
+        elif args.kld_weight != 0:
+            # KLD term
+            kld_loss = torch.sum(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim=1), dim=0)
+            if args.use_C:
+                # KLD term w/ control constant
+                self.C_max = torch.FloatTensor([args.C_max]).to(device=self.device)
+                C = torch.clamp(self.C_max/args.epochs*curr_epoch, torch.FloatTensor([0]).to(device=self.device), self.C_max)
+                loss += args.kld_weight * (kld_loss - C.squeeze(dim=0)).abs()
+            else:
+                print('kld loss:', args.kld_weight * kld_loss)
+                loss += args.kld_weight * kld_loss
+        return loss
+
+    def forward(self, x, idx=None, a=None, get_target=False):
+
+        if idx is None:
+            idx = torch.randint(0, len(self.alpha_bars), (x.size(0), )).to(device = self.device)
+            used_alpha_bars = self.alpha_bars[idx][:, None, None, None]
+            epsilon = torch.randn_like(x)
+            x_tilde = torch.sqrt(used_alpha_bars) * x + torch.sqrt(1 - used_alpha_bars) * epsilon
+            # 计算解耦偏移量，beta_step 可以根据需要调整
+            offset = self.disentangle_offset(x_tilde, 1)
+            x_tilde = x_tilde + offset
+        else:
+            idx = torch.Tensor([idx for _ in range(x.size(0))]).to(device = self.device).long()
+            x_tilde = x
+
+        if a is None:
+            a, a_q, mu, log_var = self.encoder(x)
+        else:
+            a_q = a
+
+        if self.mmd_weight != 0 and self.kld_weight != 0:
+            output = self.backbone(x_tilde, idx, a_q)
+        elif self.mmd_weight == 0 and self.kld_weight == 0:
+            output = self.backbone(x_tilde, idx, a)
+        elif self.mmd_weight != 0:
+            output = self.backbone(x_tilde, idx, a)
+        elif self.kld_weight != 0:
+            output = self.backbone(x_tilde, idx, a_q)
+
+        return (output, epsilon, a, mu, log_var) if get_target else output
+    
+    def disentangle_offset(self, previous_noise, beta_step=1):
+        """
+            Introduce a disentanglement offset during the forward process in diffusion.
+
+            Args:
+                previous_noise (torch.Tensor): The input noise tensor of shape (batch_size, channel, img_height, img_width).
+                beta_step (float): Scaling factor for the offset.
+
+            Returns:
+                torch.Tensor: The adjusted noise tensor with the disentanglement offset applied.
+        """
+        # Get the batch size, channels, height, and width
+        batch_size, channels, height, width = previous_noise.shape
+
+        # Flatten the spatial dimensions (height, width) to create features
+        flattened_noise = previous_noise.view(batch_size, channels, -1)  # Shape: (batch_size, channels, num_pixels)
+
+        # Normalize each vector in the batch to have unit norm
+        flattened_noise = flattened_noise.view(batch_size, -1)  # Flatten to (batch_size, channels * num_pixels)
+        normalized_noise = torch.nn.functional.normalize(flattened_noise, p=2, dim=1)  # Shape: (batch_size, channels * num_pixels)
+
+        # Compute pairwise cosine similarities
+        cosine_similarities = torch.mm(normalized_noise, normalized_noise.T)  # Shape: (batch_size, batch_size)
+
+        # Remove diagonal elements (self-similarities) to compute D
+        mask = torch.eye(cosine_similarities.size(0), device=cosine_similarities.device).bool()
+        cosine_similarities = cosine_similarities.masked_fill(mask, 0)
+
+        # Compute the sum of off-diagonal elements (D) 
+        disentanglement_offset = torch.sum(cosine_similarities, dim=1, keepdim=True)  # Shape: (batch_size, 1)
+
+        # Scale the disentanglement offset with beta_step
+        disentanglement_offset *= beta_step
+
+        # Reshape the disentanglement offset to match the spatial dimensions
+        disentanglement_offset = disentanglement_offset.view(batch_size, 1, 1, 1)  # Shape: (batch_size, 1, 1, 1)
+        disentanglement_offset = disentanglement_offset.expand(-1, channels, height, width)  # Shape: (batch_size, channels, height, width)
+        # print('disentanglement_offset.shape', disentanglement_offset.shape)
+
+        return disentanglement_offset
+    
 class Diff(nn.Module):
     def __init__(self, args, device, shape):
         '''

@@ -1,0 +1,7 @@
+diff_mnist_256d_0_1mmd_latent.npz
+__pycache__/*
+*.png
+*.npz
+data/*
+*.pyc
+*.pth

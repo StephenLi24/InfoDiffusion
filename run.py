@@ -7,7 +7,7 @@ from tqdm.auto import tqdm, trange
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
 from data import get_dataset, get_dataset_config
-from models import InfoDiff, Diff, VAE
+from models import InfoDiff, Diff, OptDiff, VAE
 from sampling import DiffusionProcess, TwoPhaseDiffusionProcess, LatentDiffusionProcess
 from utils import (
     AverageMeter, ProgressMeter, GradualWarmupScheduler, \
@@ -30,7 +30,7 @@ def parse_args():
     parser.add_argument('--img_id', type=int, default=0,
                         help='the id of given img')
     parser.add_argument('--model', required=True,
-                        choices=['diff', 'vae', 'vanilla'], help='which type of model to run')
+                        choices=['diff', 'vae', 'vanilla', 'opt_diff'], help='which type of model to run')
     parser.add_argument('--mode', required=True,
                         choices=['train', 'eval', 'eval_fid', 'save_latent', 'disentangle',
                                  'interpolate', 'save_original_img', 'latent_quality', 
@@ -46,7 +46,7 @@ def parse_args():
     parser.add_argument('--C_max', type=float, default=25,
                         help='control constant of kld loss (orig defualt: 25 for simple, 50 for complex)')
     parser.add_argument('--dataset', required=True,
-                        choices=['fmnist', 'mnist', 'celeba', 'cifar10', 'dsprites', 'chairs', 'ffhq'], help='training dataset')
+                        choices=['fmnist', 'mnist', 'celeba', 'cifar10', 'dsprites', 'chairs', 'ffhq', '3dshapes'], help='training dataset')
     parser.add_argument('--img_folder', default='./imgs',
                         help='path to save sampled images')
     parser.add_argument('--log_folder', default='./logs',
@@ -92,6 +92,7 @@ def parse_args():
                         help='use latent diffusion for unconditional sampling.')
     parser.add_argument('--is_bottleneck', action='store_true',
                         help='only fuse aux variable in bottleneck layers.')
+    parser.add_argument('--opt_dis', action='store_true',default = False, help='use optimazation disentanglement')
     args = parser.parse_args()
 
     return args
@@ -107,11 +108,13 @@ def save_images(args, sample=None, epoch=0, sample_num=0):
     else:
         if args.model == 'vanilla':
             root = os.path.join(root, 'diff')
+        elif args.model == 'opt_diff':
+            root = os.path.join(root, 'opt_diff')
     root = os.path.join(root, generate_exp_string(args))
     if args.mode == 'eval':
         root = os.path.join(root, 'eval')
     elif args.mode == 'disentangle':
-        root = os.path.join(root, f'disentangle-{args.img_id}')
+        root = os.path.join(root, f'disentangle-{args.img_id}-{args.epochs}')
     elif args.mode == 'interpolate':
         root = os.path.join(root, f'interpolate-{args.img_id}')
     elif args.mode == 'save_latent':
@@ -132,7 +135,8 @@ def save_images(args, sample=None, epoch=0, sample_num=0):
             save_image(sample, path, normalize=True, range=img_range)
     elif args.mode == 'disentangle':
         path = os.path.join(root, f"sample{sample_num}.png")
-        save_image(sample, path, normalize=True, range=img_range, nrow=sample.shape[0])
+        # save_image(sample, path, normalize=True, range=img_range, nrow=sample.shape[0])
+        save_image(sample, path, normalize=True, value_range=img_range, nrow=sample.shape[0])
     elif args.mode == 'interpolate':
         path = os.path.join(root, f"sample{sample_num}.png")
         save_image(sample, path, normalize=True, range=img_range, nrow=sample.shape[0])
@@ -149,6 +153,8 @@ def save_model(args, epoch, model):
     else:
         if args.model == 'vanilla':
             root = os.path.join(root, 'diff')
+        elif args.model == 'opt_diff':
+            root = os.path.join(root, 'opt_diff')
     root = os.path.join(root, generate_exp_string(args))
     if args.mode == "train_latent_ddim":
         root += '_latent' 
@@ -174,6 +180,8 @@ def train(args):
         model = Diff(args, device, shape)
     elif args.model == 'vae':
         model = VAE(args, device, shape)
+    elif args.model == 'opt_diff':
+        model = OptDiff(args, device, shape)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-5)
 
     losses = AverageMeter('Loss', ':.4f')
@@ -184,16 +192,21 @@ def train(args):
     warmUpScheduler = GradualWarmupScheduler(
         optimizer=optimizer, multiplier=2., warm_epoch=1, after_scheduler=cosineScheduler)
 
+    epoch_bar = tqdm(range(args.epochs), desc="Epoch")
     global_step = 0
-    for curr_epoch in trange(0, args.epochs, desc="Epoch #"):
+    for curr_epoch in epoch_bar:
+        # 动态更新描述，显示当前 epoch 数
+        epoch_bar.set_description(f"Epoch {curr_epoch+1}/{args.epochs}")
+        epoch_bar.refresh()
         total_loss = 0
-        batch_bar = tqdm(dataloader, desc="Batch #")
+        batch_bar = tqdm(dataloader, desc="Batch")
         for idx, data in enumerate(batch_bar):
-            if args.dataset in ['fmnist', 'mnist', 'celeba', 'cifar10']:
+            if args.dataset in ['fmnist', 'mnist', 'celeba', 'cifar10', 'dsprites', '3dshapes']:
+                # print('data', data.keys())
                 data = data[0]
             data = data.to(device=device)
             loss = model.loss_fn(args=args, x=data, curr_epoch=curr_epoch)
-            batch_bar.set_postfix(loss=format(loss,'.4f'))
+            batch_bar.set_postfix(loss=format(loss, '.4f'),epoch=f"{curr_epoch+1}/{args.epochs}")
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
@@ -203,13 +216,12 @@ def train(args):
             if tb_logger:
                 tb_logger.add_scalar('train/loss', loss.item(), global_step)
         losses.update(total_loss / idx)
-        current_epoch = curr_epoch
-        progress.display(current_epoch)
-        current_epoch += 1
+        progress.display(curr_epoch)
         warmUpScheduler.step()
         losses.reset()
-        if current_epoch % args.save_epochs == 0:
-            save_model(args, current_epoch, model)
+        if (curr_epoch+1) % args.save_epochs == 0:
+            save_model(args, curr_epoch+1, model)
+
 
 
 def eval(args):
@@ -227,6 +239,9 @@ def eval(args):
         elif args.model == 'vae':
             model = VAE(args, device, shape)
             root = os.path.join(root, 'vae')
+        elif args.model == 'opt_diff':
+            model = OptDiff(args, device, shape)
+            root = os.path.join(root, 'opt_diff')
         root = os.path.join(root, generate_exp_string(args))
         path = os.path.join(root, f'model-{args.epochs}.pth')
         print(f"Loading model from {path}")
@@ -251,7 +266,7 @@ def eval(args):
                 model2.load_state_dict(torch.load(path2, map_location=device), strict=True)
             model2.eval()
         model.eval()
-        if args.model in ['diff', 'vanilla']:
+        if args.model in ['diff', 'vanilla', 'opt_diff']:
             process = DiffusionProcess(args, model, device, shape)
     if args.mode == 'eval':
         if args.model in ['diff', 'vanilla']:
@@ -266,6 +281,8 @@ def eval(args):
         root = f'{args.img_folder}'
         if args.model == 'vae':
             root = os.path.join(root, 'vae')
+        elif args.model == 'opt_diff':
+            root = os.path.join(root, 'opt_diff')
         root = os.path.join(root, generate_exp_string(args))
         if args.is_latent:
             root = os.path.join(root, 'eval-fid-latent')
@@ -273,7 +290,7 @@ def eval(args):
             root = os.path.join(root, 'eval-fid-fast')
         os.makedirs(root, exist_ok=True)
         print(f"Saving images to {root}")
-        if args.model == 'diff':
+        if args.model == 'diff' or 'opt_diff':
             if args.is_latent:
                 process_latent = LatentDiffusionProcess(args, model2, device)
             else:
@@ -393,6 +410,9 @@ def eval(args):
         if args.model == 'diff':
             xT = process.reverse_sampling(data, a)
             xT = xT.repeat(len(eta), 1, 1, 1)
+        elif args.model == 'opt_diff':
+            xT = process.reverse_sampling(data, a)
+            xT = xT.repeat(len(eta), 1, 1, 1)
         for k in range(args.a_dim):
             a_list = []
             for e in eta:
@@ -411,15 +431,17 @@ def eval(args):
                 sample = process.sampling(xT=xT, a=a)
             elif args.model == 'vae':
                 sample = model.decoder(a)
+            elif args.model == 'opt_diff':
+                sample = process.sampling(xT=xT, a=a)
             save_images(args, sample, sample_num=k)
     elif args.mode == 'save_latent':
         all_a, all_attr = [], []
         dataloader = get_dataset(args)
         for idx, data in enumerate(dataloader):
-            if args.dataset in ['fmnist', 'mnist', 'celeba', 'cifar10', 'dsprites']:
+            if args.dataset in ['fmnist', 'mnist', 'celeba', 'cifar10', 'dsprites', '3dshapes']:
                 data_all = data
                 data = data_all[0]
-                if args.dataset in ['celeba', 'fmnist', 'mnist', 'cifar10']:
+                if args.dataset in ['celeba', 'fmnist', 'mnist', 'cifar10', '3dshapes']:
                     latents_classes = data_all[1]
                 elif args.dataset == 'dsprites':
                     latents_classes = data_all[2]
@@ -440,7 +462,7 @@ def eval(args):
             all_attr.append(latents_classes)
         all_a = np.concatenate(all_a)
         all_attr = np.concatenate(all_attr)
-        np.savez("{}_{}_latent".format(args.model, generate_exp_string(args).replace(".", "_")), all_a = all_a, all_attr = all_attr)
+        np.savez("{}_{}_latent_epoch{}".format(args.model, generate_exp_string(args).replace(".", "_"), args.epochs), all_a = all_a, all_attr = all_attr)
     elif args.mode == 'interpolate':
         dataloader = get_dataset(args)
         for idx, data in enumerate(dataloader):
@@ -480,7 +502,7 @@ def eval(args):
             sample = model.decoder(intp_a)
         save_images(args, sample)
     elif args.mode == 'train_latent_ddim':
-        dataset = LatentDataset("{}_{}_latent.npz".format(args.model, generate_exp_string(args).replace(".", "_")))
+        dataset = LatentDataset("{}_{}_latent_epoch{}.npz".format(args.model, generate_exp_string(args).replace(".", "_"), args.epochs))
         dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
         seed_everything(args.r_seed)
         log_dir = f'{args.log_folder}'

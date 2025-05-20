@@ -18,7 +18,7 @@ def parse_args():
     parser.add_argument('--img_id', type=int, default=0,
                         help='the id of given img')
     parser.add_argument('--model', required=True,
-                        choices=['diff', 'vae', 'vanilla'], help='which type of model to run')
+                        choices=['diff', 'vae', 'vanilla', 'opt_diff'], help='which type of model to run')
     parser.add_argument('--mode', required=True,
                         choices=['train', 'eval', 'eval_fid', 'save_latent', 'disentangle',
                                  'interpolate', 'save_original_img', 'latent_quality',
@@ -34,7 +34,7 @@ def parse_args():
     parser.add_argument('--C_max', type=float, default=25,
                         help='control constant of kld loss (orig defualt: 25 for simple, 50 for complex)')
     parser.add_argument('--dataset', required=True,
-                        choices=['fmnist', 'mnist', 'celeba', 'cifar10', 'dsprites', 'chairs', 'ffhq'],
+                        choices=['fmnist', 'mnist', 'celeba', 'cifar10', 'dsprites', 'chairs', 'ffhq', '3dshapes'],
                         help='training dataset')
     parser.add_argument('--img_folder', default='./imgs',
                         help='path to save sampled images')
@@ -363,10 +363,16 @@ class TADMetric():
         return aurs_diffs_filt.sum().item(), auroc_result.cpu().numpy(), len(aurs_diffs_filt)
 
 if __name__ == "__main__":
-    dataset = "celeba"
     args = parse_args()
-    data_dict = np.load("{}_{}_latent.npz".format(args.model, generate_exp_string(args).replace(".", "_")), allow_pickle=True)
-
+    dataset = args.dataset
+    data_dict = np.load("{}_{}_latent_epoch{}.npz".format(args.model, generate_exp_string(args).replace(".", "_"), args.epochs), allow_pickle=True)
+    # data_dict = np.load("/home/llb/Asyrp_official/middle_h_edit.npz")
+    print(data_dict.files)
+    all_a = data_dict['all_a'][:10000, :]
+    print(data_dict['all_a'].shape)
+    print(data_dict['all_attr'])
+    # print(data_dict['all_attr'])
+    # print('datadict:', "{}_{}_latent.npz".format(args.model, generate_exp_string(args).replace(".", "_")))
     if dataset == "celeba":
         y_names = ['5_o_Clock_Shadow', 'Arched_Eyebrows', 'Attractive', 'Bags_Under_Eyes', 'Bald',
                    'Bangs', 'Big_Lips', 'Big_Nose', 'Black_Hair', 'Blond_Hair',
@@ -392,8 +398,10 @@ if __name__ == "__main__":
         output_type = "c"
 
     if dataset == "celeba":
+        # a = all_a.reshape(all_a.shape[0], -1)
+        # y = data_dict["all_attr"][:10000,:].astype(int)
         a = data_dict["all_a"][:10000,:]
-        y = data_dict["all_attr"][:10000,:].astype(np.int)
+        y = data_dict["all_attr"][:10000,:].astype(int)
     elif dataset == "ffhq":
         a = data_dict["all_a"][:,:]
         y = pd.read_csv("ffhq_labels.csv")
